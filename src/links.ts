@@ -1,46 +1,44 @@
 import { Stream } from 'node:stream';
 import { WritableStream } from 'htmlparser2/WritableStream';
 import { parseSrcset } from 'srcset';
+import type { ElementMetadata } from './types.js';
 
-const linksAttribute: Record<string, string[]> = {
-	background: ['body'],
-	cite: ['blockquote', 'del', 'ins', 'q'],
-	data: ['object'],
-	href: ['a', 'area', 'embed', 'link'],
-	icon: ['command'],
-	longdesc: ['frame', 'iframe'],
-	manifest: ['html'],
-	content: ['meta'],
-	poster: ['video'],
-	pluginspage: ['embed'],
-	pluginurl: ['embed'],
-	src: [
-		'audio',
-		'embed',
-		'frame',
-		'iframe',
-		'img',
-		'input',
-		'script',
-		'source',
-		'track',
-		'video',
-	],
-	srcset: ['img', 'source'],
+type TagConfig = {
+	urlAttrs: string[];
+	captureText?: boolean;
+	attributeKey?: string;
 };
-// Create lookup table for tag name to attribute that contains URL:
-const tagAttribute: Record<string, string[]> = {};
-for (const attribute of Object.keys(linksAttribute)) {
-	for (const tag of linksAttribute[attribute]) {
-		tagAttribute[tag] ||= [];
-		tagAttribute[tag].push(attribute);
-	}
-}
+
+const tagConfigs: Record<string, TagConfig> = {
+	a: { urlAttrs: ['href'], captureText: true },
+	area: { urlAttrs: ['href'] },
+	audio: { urlAttrs: ['src'] },
+	blockquote: { urlAttrs: ['cite'], captureText: true },
+	body: { urlAttrs: ['background'] },
+	command: { urlAttrs: ['icon'] },
+	del: { urlAttrs: ['cite'], captureText: true },
+	embed: { urlAttrs: ['href', 'pluginspage', 'pluginurl', 'src'] },
+	frame: { urlAttrs: ['longdesc', 'src'] },
+	html: { urlAttrs: ['manifest'] },
+	iframe: { urlAttrs: ['longdesc', 'src'] },
+	img: { urlAttrs: ['src', 'srcset'], attributeKey: 'alt' },
+	input: { urlAttrs: ['src'] },
+	ins: { urlAttrs: ['cite'], captureText: true },
+	link: { urlAttrs: ['href'] },
+	meta: { urlAttrs: ['content'] },
+	object: { urlAttrs: ['data'] },
+	q: { urlAttrs: ['cite'], captureText: true },
+	script: { urlAttrs: ['src'] },
+	source: { urlAttrs: ['src', 'srcset'] },
+	track: { urlAttrs: ['src'] },
+	video: { urlAttrs: ['poster', 'src'] },
+};
 
 export type ParsedUrl = {
 	link: string;
 	error?: Error;
 	url?: URL;
+	metadata?: ElementMetadata;
 };
 
 export async function getLinks(
@@ -49,11 +47,16 @@ export async function getLinks(
 ): Promise<ParsedUrl[]> {
 	let realBaseUrl = baseUrl;
 	let baseSet = false;
-	const links = new Array<ParsedUrl>();
+
+	// Tracks all open tags that have text to be captured
+	let activeTextCapture: { tag: string; parsed: ParsedUrl }[] = [];
+
+	const links: ParsedUrl[] = [];
+
 	const parser = new WritableStream({
 		onopentag(tag: string, attributes: Record<string, string>) {
 			// Allow alternate base URL to be specified in tag:
-			if (tag === 'base' && !baseSet) {
+			if (tag === 'base' && !baseSet && attributes.href) {
 				realBaseUrl = getBaseUrl(attributes.href, baseUrl);
 				baseSet = true;
 			}
@@ -74,16 +77,54 @@ export async function getLinks(
 				}
 			}
 
-			if (tagAttribute[tag]) {
-				for (const attribute of tagAttribute[tag]) {
-					const linkString = attributes[attribute];
-					if (linkString) {
-						for (const link of parseAttribute(attribute, linkString)) {
-							links.push(parseLink(link, realBaseUrl));
-						}
+			const cfg = tagConfigs[tag];
+			// Nothing to do for this tag
+			if (!cfg) {
+				return;
+			}
+
+			// Iterate over tag attributes that could contain URLs
+			for (const attr of cfg.urlAttrs) {
+				const raw = attributes[attr];
+				if (!raw) {
+					continue;
+				}
+
+				for (const parsedAttribute of parseAttribute(attr, raw)) {
+					const parsedUrl = parseLink(parsedAttribute, realBaseUrl);
+					parsedUrl.metadata = {
+						tag,
+					};
+
+					// Use specified attribute to identify element
+					if (cfg.attributeKey && attributes[cfg.attributeKey]) {
+						parsedUrl.metadata[cfg.attributeKey] = attributes[cfg.attributeKey];
 					}
+
+					// Add element to array of currently open tags to capture following inner text
+					if (cfg.captureText) {
+						parsedUrl.metadata.text = '';
+						activeTextCapture.push({
+							tag,
+							parsed: parsedUrl,
+						});
+					}
+
+					links.push(parsedUrl);
 				}
 			}
+		},
+		ontext(data) {
+			// Add text to all currently open tags
+			for (const entry of activeTextCapture) {
+				if (entry.parsed.metadata) {
+					entry.parsed.metadata.text += data.trim();
+				}
+			}
+		},
+		onclosetag(tag) {
+			// Remove now closed tag from array of opened tags
+			activeTextCapture = activeTextCapture.filter((e) => e.tag !== tag);
 		},
 	});
 	await new Promise((resolve, reject) => {
@@ -119,11 +160,7 @@ function isAbsoluteUrl(url: string): boolean {
 function parseAttribute(name: string, value: string): string[] {
 	switch (name) {
 		case 'srcset': {
-			// The swapping of any multiple spaces into a single space is here to
-			// work around this bug:
-			// https://github.com/sindresorhus/srcset/issues/14
-			const strippedValue = value.replace(/\s+/, ' ');
-			return parseSrcset(strippedValue).map((p) => p.url);
+			return parseSrcset(value).map((p) => p.url);
 		}
 
 		default: {
