@@ -11,6 +11,7 @@ import {
 	check,
 } from '../src/index.js';
 import { DEFAULT_USER_AGENT } from '../src/options.js';
+import { invertedPromise } from './utils.js';
 
 nock.disableNetConnect();
 nock.enableNetConnect('localhost');
@@ -631,6 +632,7 @@ describe('linkinator', () => {
 			results.links[1]?.elementMetadata?.linkText,
 			'just follow a link',
 		);
+		assert.ok(!results.passed);
 		scope.done();
 	});
 
@@ -641,6 +643,25 @@ describe('linkinator', () => {
 			results.links[1]?.elementMetadata?.quoteText,
 			'Quote Text',
 		);
+		assert.ok(!results.passed);
+		scope.done();
+	});
+
+	it('should provide <a> text in `link` event', async () => {
+		const scope = nock('http://fake.local').head('/').reply(404);
+		const { promise, resolve } = invertedPromise();
+		const checker = new LinkChecker();
+		let count = 0;
+		checker.on('link', (e) => {
+			if (count === 1) {
+				assert.strictEqual(e.elementMetadata?.linkText, 'just follow a link');
+				resolve();
+			}
+			count++;
+		});
+		const results = await checker.check({ path: 'test/fixtures/basic' });
+		await promise;
+		assert.ok(!results.passed);
 		scope.done();
 	});
 });
